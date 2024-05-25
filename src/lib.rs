@@ -1,5 +1,5 @@
 use log::{error, info, trace};
-use std::{ffi::c_void, path::Path};
+use std::{ffi::c_void, marker::PhantomData, path::Path, sync::Arc};
 use sysinfo::{Pid, PidExt};
 use thiserror::Error;
 use windows_sys::{
@@ -12,7 +12,7 @@ use windows_sys::{
             LibraryLoader::{GetModuleHandleA, GetProcAddress},
             Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE},
             Threading::{
-                CreateRemoteThread, OpenProcess, WaitForSingleObject, INFINITE,
+                CreateRemoteThread, GetExitCodeThread, OpenProcess, WaitForSingleObject, INFINITE,
                 PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
             },
         },
@@ -32,17 +32,17 @@ pub enum InjectorError {
     #[error("Process is not active: `{0}`")]
     ProcessNotActive(String),
     #[error("Unable to obtain handle to Kernel32 Module")]
-    KernelModule(),
+    KernelModule,
     #[error("Unable to obtain handle to LoadLibrary Proc")]
-    LoadLibraryProc(),
+    LoadLibraryProc,
     #[error("Unable to open process")]
-    ProcessOpen(),
+    ProcessOpen,
     #[error("Unable to allocate memory in target process")]
-    AllocationFailure(),
+    AllocationFailure,
     #[error("Unable to write specified memory")]
-    WriteFailure(),
+    WriteFailure,
     #[error("Unable to spawn remote thread")]
-    RemoteThread(),
+    RemoteThread,
 }
 
 /// Injects the payload pointed to by `payload_location` into `pid`.
@@ -57,45 +57,52 @@ pub fn inject_into(
     let pid = pid.into();
 
     info!(
-        "Injecting Payload: {:#?} into Pid: {}",
+        "injecting Payload: {:#?} into Pid: {}",
         payload_location, pid
     );
 
     let kernel_module = get_kernel_module()?;
-    info!("Identified kernel module: {:#?}", kernel_module);
+    info!("locally identified kernel module: {:#?}", kernel_module);
 
-    let load_library_proc = get_load_library_proc(kernel_module)?;
+    let load_library_proc = resolve_load_library(kernel_module)?;
     info!(
-        "Identified load library proc: {:#?}",
+        "locally identified load library proc: {:#?}",
         load_library_proc as *const usize
     );
 
-    let raw_process = RawProcess::open(pid)?;
+    let raw_process = RemoteProcess::open(pid)?;
     let write_size = payload_location.len() + 1;
     let raw_allocation = raw_process.allocate(write_size, MEM_COMMIT, PAGE_READWRITE)?;
 
     let payload_cstring = match std::ffi::CString::new(payload_location) {
         Ok(cstring) => cstring,
         Err(err) => {
-            error!("Unable to create CString from payload absolute path");
+            error!("unable to create CString from payload absolute path");
             return Err(InjectorError::PayloadCString(err));
         }
     };
     raw_allocation.write(payload_cstring.as_ptr() as *mut c_void)?;
-    raw_allocation.spawn_thread_with_args(load_library_proc)?;
+    raw_allocation
+        .spawn_thread_with_args(load_library_proc)?
+        .wait()?;
 
     Ok(())
 }
 
-struct ContextedRemoteThread<'process> {
-    _process: &'process RawProcess,
+/// A remote thread which depends on a process.
+/// If you want to spawn the thread and then block for its remote completion, consider the wait function.
+/// Regardless of how you use the instance, your thread handle will be closed on drop.
+/// This does not exit the thread, but it will drop our view of it. And you will not be able to reobtain the handle.
+pub struct RemoteThread<'process> {
+    _process: RemoteProcess<'process>,
     thread: HANDLE,
 }
 
-impl<'process> ContextedRemoteThread<'process> {
-    fn spawn_with_args(
-        process: &'process RawProcess,
-        allocation: &'process RawAllocation,
+impl<'process> RemoteThread<'process> {
+    /// Provides a function to spawn a remote thread
+    pub fn spawn_with_args(
+        process: RemoteProcess<'process>,
+        allocation: &'process RemoteAllocation,
         entry_function: LoadLibraryA,
     ) -> Result<Self, InjectorError> {
         let thread = unsafe {
@@ -112,35 +119,50 @@ impl<'process> ContextedRemoteThread<'process> {
         };
 
         if thread == 0 {
-            return Err(InjectorError::RemoteThread());
+            return Err(InjectorError::RemoteThread);
         }
 
-        Ok(ContextedRemoteThread {
+        Ok(RemoteThread {
             _process: process,
             thread,
         })
     }
+
+    /// Consumes the remote thread, waiting for it to exit.
+    /// Returns the exit code on success.
+    /// Regardless of execution. Self will be consumed and the thread handle closed.
+    pub fn wait(self) -> Result<u32, InjectorError> {
+        let wait_status = unsafe { WaitForSingleObject(self.thread, INFINITE) };
+
+        if wait_status != 0 {
+            return Err(InjectorError::RemoteThread);
+        }
+
+        let mut result = 0;
+        let _exit_status = unsafe { GetExitCodeThread(self.thread, &mut result) };
+        Ok(result)
+    }
 }
 
-impl<'process> Drop for ContextedRemoteThread<'process> {
+impl<'process> Drop for RemoteThread<'process> {
     fn drop(&mut self) {
-        trace!("Closing thread handle");
         unsafe {
-            WaitForSingleObject(self.thread, INFINITE);
             CloseHandle(self.thread);
         };
     }
 }
 
-struct RawAllocation<'process> {
-    process: &'process RawProcess,
+/// An allocation of memory in the remote process
+pub struct RemoteAllocation<'process> {
+    process: RemoteProcess<'process>,
     allocation: *mut c_void,
     size: usize,
 }
 
-impl<'process> RawAllocation<'process> {
-    fn allocate(
-        process: &'process RawProcess,
+impl<'process> RemoteAllocation<'process> {
+    /// A way to create a remote allocation, given a process we attempt to provision the allocation of a desired size, allocation flags, and protection flags.
+    pub fn allocate(
+        process: RemoteProcess<'process>,
         size: usize,
         allocation_flags: u32,
         protection_flags: u32,
@@ -156,34 +178,38 @@ impl<'process> RawAllocation<'process> {
         };
 
         if allocation.is_null() {
-            return Err(InjectorError::AllocationFailure());
+            return Err(InjectorError::AllocationFailure);
         }
 
         trace!(
-            "Allocated n bytes: {}, with allocation_flags: {}, and protection_flags: {}",
+            "allocated n bytes: {}, with allocation_flags: {}, and protection_flags: {}",
             size,
             allocation_flags,
             protection_flags
         );
 
-        Ok(RawAllocation {
+        Ok(RemoteAllocation {
             process,
             allocation,
             size,
         })
     }
 
-    fn spawn_thread_with_args(
+    /// Spawns a thread using this remote allocation's address as the input
+    /// You should have your arguments aligned properly at the head of this allocation prior to spawning a thread with this as the inputs.
+    pub fn spawn_thread_with_args(
         &self,
         entry_function: LoadLibraryA,
-    ) -> Result<ContextedRemoteThread, InjectorError> {
-        ContextedRemoteThread::spawn_with_args(self.process, self, entry_function)
+    ) -> Result<RemoteThread, InjectorError> {
+        RemoteThread::spawn_with_args(self.process.clone(), self, entry_function)
     }
 
     fn inner(&self) -> *mut c_void {
         self.allocation
     }
 
+    /// Make this public when safer.
+    /// Probably force provide the full buffer and desired size on initialize
     fn write(&self, buffer: *mut c_void) -> Result<usize, InjectorError> {
         let mut bytes_written: usize = 0;
 
@@ -198,11 +224,11 @@ impl<'process> RawAllocation<'process> {
         };
 
         if write_result == 0 || bytes_written == 0 {
-            return Err(InjectorError::WriteFailure());
+            return Err(InjectorError::WriteFailure);
         }
 
         trace!(
-            "Wrote n bytes: {} for allocation of size: {}",
+            "wrote n bytes: {} for allocation of size: {}",
             bytes_written,
             self.size
         );
@@ -211,9 +237,8 @@ impl<'process> RawAllocation<'process> {
     }
 }
 
-impl<'process> Drop for RawAllocation<'process> {
+impl<'process> Drop for RemoteAllocation<'process> {
     fn drop(&mut self) {
-        trace!("Dropping allocated data");
         unsafe {
             VirtualFreeEx(
                 self.process.inner(),
@@ -225,12 +250,16 @@ impl<'process> Drop for RawAllocation<'process> {
     }
 }
 
-struct RawProcess {
-    handle: HANDLE,
+/// A Process handle. You can initialize with open(pid)
+#[derive(Clone)]
+pub struct RemoteProcess<'h> {
+    handle: Arc<HANDLE>,
+    handle_lifetime: PhantomData<&'h ()>,
 }
 
-impl RawProcess {
-    fn open(pid: Pid) -> Result<Self, InjectorError> {
+impl<'h> RemoteProcess<'h> {
+    /// Attempts to open a handle by pid.
+    pub fn open(pid: Pid) -> Result<Self, InjectorError> {
         let handle = unsafe {
             OpenProcess(
                 PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
@@ -240,48 +269,55 @@ impl RawProcess {
         };
 
         if handle == 0 {
-            return Err(InjectorError::ProcessOpen());
+            return Err(InjectorError::ProcessOpen);
         }
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle: Arc::new(handle),
+            handle_lifetime: PhantomData,
+        })
     }
 
-    fn allocate(
+    /// Allocates memory in the raw process.
+    pub fn allocate(
         &self,
         size: usize,
         allocation_flags: u32,
         protection_flags: u32,
-    ) -> Result<RawAllocation, InjectorError> {
-        RawAllocation::allocate(self, size, allocation_flags, protection_flags)
+    ) -> Result<RemoteAllocation, InjectorError> {
+        RemoteAllocation::allocate(self.clone(), size, allocation_flags, protection_flags)
     }
 
+    /// A reference to the inner handle
     fn inner(&self) -> HANDLE {
-        self.handle
+        *self.handle
     }
 }
 
-impl Drop for RawProcess {
+impl Drop for RemoteProcess<'_> {
     fn drop(&mut self) {
-        trace!("Dropping Process Handle");
         unsafe {
-            CloseHandle(self.handle as HANDLE);
+            CloseHandle(*self.handle as HANDLE);
         }
     }
 }
 
-fn get_kernel_module() -> Result<HMODULE, InjectorError> {
+/// Attempts to acquire a handle to kernel32.
+/// A handle to the kernel32 is required for injection.
+pub fn get_kernel_module() -> Result<HMODULE, InjectorError> {
     let kernel_module = unsafe { GetModuleHandleA(s!("kernel32.dll")) };
 
     if kernel_module == 0 {
-        return Err(InjectorError::KernelModule());
+        return Err(InjectorError::KernelModule);
     }
 
     Ok(kernel_module)
 }
 
-fn get_load_library_proc(kernel_module: HMODULE) -> Result<LoadLibraryA, InjectorError> {
+/// Attempts to resolve LoadLibraryA function locally.
+pub fn resolve_load_library(kernel_module: HMODULE) -> Result<LoadLibraryA, InjectorError> {
     let load_library_proc = unsafe { GetProcAddress(kernel_module, s!("LoadLibraryA")) }
-        .ok_or(InjectorError::LoadLibraryProc())?;
+        .ok_or(InjectorError::LoadLibraryProc)?;
 
     let load_library_proc: LoadLibraryA = unsafe { std::mem::transmute(load_library_proc) };
 

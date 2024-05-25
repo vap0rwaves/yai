@@ -15,16 +15,16 @@ default = ["cli"]
 cli = ["clap"]
 
 [dependencies]
-clap = { version = "4.0.15", features = ["derive"], optional = true }
-log = "0.4.17"
+clap = { version = "4.5.4", features = ["derive"], optional = true }
+log = "0.4.21"
 pretty_env_logger = "0.4.0"
-thiserror = "1.0.32"
-sysinfo = "0.26.4"
+thiserror = "1.0.61"
+sysinfo = "0.26.9"
 windows-sys = { version = "0.48.0", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_System_LibraryLoader",
-    "Win32_System_Diagnostics_Debug"
+    "Win32_System_Diagnostics_Debug",
 ] }
